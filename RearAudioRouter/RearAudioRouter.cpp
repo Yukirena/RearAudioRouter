@@ -22,8 +22,13 @@
 #include <deque>
 #include <algorithm>
 
+#include <shellapi.h>
+#include <shlobj.h>
+
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Ole32.lib")
+
+#pragma comment(lib, "Shell32.lib")
 
 #define IDC_COMBO_INPUT     1001
 #define IDC_COMBO_OUTPUT    1002
@@ -33,6 +38,12 @@
 #define MAX_LOADSTRING 100
 
 #define WM_AUDIO_STOPPED (WM_APP + 1)
+
+#define WM_TRAYICON (WM_APP + 2)
+
+#define ID_TRAY_OPEN       2001
+#define ID_TRAY_STARTSTOP  2002
+#define ID_TRAY_EXIT       2003
 
 // 전역 변수:
 HINSTANCE hInst;                                // 현재 인스턴스입니다.
@@ -49,6 +60,10 @@ std::vector<std::wstring> g_outputDeviceIds;
 
 std::thread g_audioThread;
 std::atomic<bool> g_audioRunning = false;
+
+NOTIFYICONDATA g_nid = {};
+
+std::wstring g_configPath;
 
 // 이 코드 모듈에 포함된 함수의 선언을 전달합니다:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -307,33 +322,8 @@ bool ValidateOutputDevice(HWND hWnd)
 
     wchar_t message[512];
 
-    swprintf_s(
-        message,
-        L"출력 장치 검증 성공\n\n"
-        L"Channels: %u\n"
-        L"Sample Rate: %u Hz\n"
-        L"Bits: %u\n"
-        L"Channel Mask: 0x%08X\n\n"
-        L"Rear Left : Channel %d\n"
-        L"Rear Right: Channel %d\n\n"
-        L"WASAPI Shared Mode: OK",
-        channelCount,
-        mixFormat->nSamplesPerSec,
-        mixFormat->wBitsPerSample,
-        channelMask,
-        rearLeftIndex + 1,
-        rearRightIndex + 1
-    );
-
     CoTaskMemFree(mixFormat);
     audioClient->Release();
-
-    MessageBox(
-        hWnd,
-        message,
-        L"RearAudioRouter",
-        MB_OK | MB_ICONINFORMATION
-    );
 
     return true;
 }
@@ -507,29 +497,8 @@ bool ValidateInputDevice(HWND hWnd)
 
     wchar_t message[512];
 
-    swprintf_s(
-        message,
-        L"입력 장치 검증 성공\n\n"
-        L"Channels: %u\n"
-        L"Sample Rate: %u Hz\n"
-        L"Bits: %u\n"
-        L"Block Align: %u bytes\n\n"
-        L"WASAPI Shared Capture: OK",
-        mixFormat->nChannels,
-        mixFormat->nSamplesPerSec,
-        mixFormat->wBitsPerSample,
-        mixFormat->nBlockAlign
-    );
-
     CoTaskMemFree(mixFormat);
     audioClient->Release();
-
-    MessageBox(
-        hWnd,
-        message,
-        L"RearAudioRouter",
-        MB_OK | MB_ICONINFORMATION
-    );
 
     return true;
 }
@@ -1321,6 +1290,278 @@ void CreateMainControls(HWND hWnd)
     );
 }
 
+void AddTrayIcon(HWND hWnd)
+{
+    g_nid = {};
+    g_nid.cbSize = sizeof(NOTIFYICONDATA);
+    g_nid.hWnd = hWnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+
+    g_nid.hIcon = LoadIcon(
+        GetModuleHandle(nullptr),
+        MAKEINTRESOURCE(IDI_REARAUDIOROUTER)
+    );
+
+    wcscpy_s(
+        g_nid.szTip,
+        L"RearAudioRouter"
+    );
+
+    Shell_NotifyIcon(
+        NIM_ADD,
+        &g_nid
+    );
+}
+
+void RemoveTrayIcon()
+{
+    if (g_nid.hWnd != nullptr)
+    {
+        Shell_NotifyIcon(
+            NIM_DELETE,
+            &g_nid
+        );
+
+        g_nid = {};
+    }
+}
+
+void HideToTray(HWND hWnd)
+{
+    ShowWindow(
+        hWnd,
+        SW_HIDE
+    );
+}
+
+void RestoreFromTray(HWND hWnd)
+{
+    ShowWindow(
+        hWnd,
+        SW_SHOW
+    );
+
+    ShowWindow(
+        hWnd,
+        SW_RESTORE
+    );
+
+    SetForegroundWindow(
+        hWnd
+    );
+}
+
+void ShowTrayMenu(HWND hWnd)
+{
+    HMENU menu = CreatePopupMenu();
+
+    if (!menu)
+        return;
+
+    AppendMenu(
+        menu,
+        MF_STRING,
+        ID_TRAY_OPEN,
+        L"Open"
+    );
+
+    AppendMenu(
+        menu,
+        MF_STRING,
+        ID_TRAY_STARTSTOP,
+        g_audioRunning
+        ? L"Stop"
+        : L"Start"
+    );
+
+    AppendMenu(
+        menu,
+        MF_SEPARATOR,
+        0,
+        nullptr
+    );
+
+    AppendMenu(
+        menu,
+        MF_STRING,
+        ID_TRAY_EXIT,
+        L"Exit"
+    );
+
+    POINT pt;
+    GetCursorPos(&pt);
+
+    SetForegroundWindow(hWnd);
+
+    TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON,
+        pt.x,
+        pt.y,
+        0,
+        hWnd,
+        nullptr
+    );
+
+    DestroyMenu(menu);
+}
+
+std::wstring GetConfigPath()
+{
+    PWSTR appDataPath = nullptr;
+
+    HRESULT hr = SHGetKnownFolderPath(
+        FOLDERID_RoamingAppData,
+        0,
+        nullptr,
+        &appDataPath
+    );
+
+    if (FAILED(hr))
+        return L"RearAudioRouter.ini";
+
+    std::wstring folder =
+        std::wstring(appDataPath) +
+        L"\\RearAudioRouter";
+
+    CoTaskMemFree(appDataPath);
+
+    CreateDirectoryW(
+        folder.c_str(),
+        nullptr
+    );
+
+    return folder + L"\\config.ini";
+}
+
+bool SelectDeviceById(
+    HWND comboBox,
+    const std::vector<std::wstring>& deviceIds,
+    const std::wstring& wantedId)
+{
+    for (size_t i = 0; i < deviceIds.size(); ++i)
+    {
+        if (deviceIds[i] == wantedId)
+        {
+            SendMessage(
+                comboBox,
+                CB_SETCURSEL,
+                static_cast<WPARAM>(i),
+                0
+            );
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void SaveSettings(bool running)
+{
+    if (g_configPath.empty())
+        return;
+
+    int inputIndex = (int)SendMessage(
+        g_hComboInput,
+        CB_GETCURSEL,
+        0,
+        0
+    );
+
+    int outputIndex = (int)SendMessage(
+        g_hComboOutput,
+        CB_GETCURSEL,
+        0,
+        0
+    );
+
+    if (inputIndex >= 0 &&
+        inputIndex < (int)g_inputDeviceIds.size())
+    {
+        WritePrivateProfileStringW(
+            L"Audio",
+            L"InputDevice",
+            g_inputDeviceIds[inputIndex].c_str(),
+            g_configPath.c_str()
+        );
+    }
+
+    if (outputIndex >= 0 &&
+        outputIndex < (int)g_outputDeviceIds.size())
+    {
+        WritePrivateProfileStringW(
+            L"Audio",
+            L"OutputDevice",
+            g_outputDeviceIds[outputIndex].c_str(),
+            g_configPath.c_str()
+        );
+    }
+
+    WritePrivateProfileStringW(
+        L"Audio",
+        L"Running",
+        running ? L"1" : L"0",
+        g_configPath.c_str()
+    );
+}
+
+bool LoadSettings()
+{
+    if (g_configPath.empty())
+        return false;
+
+    wchar_t inputId[1024] = {};
+    wchar_t outputId[1024] = {};
+
+    GetPrivateProfileStringW(
+        L"Audio",
+        L"InputDevice",
+        L"",
+        inputId,
+        1024,
+        g_configPath.c_str()
+    );
+
+    GetPrivateProfileStringW(
+        L"Audio",
+        L"OutputDevice",
+        L"",
+        outputId,
+        1024,
+        g_configPath.c_str()
+    );
+
+    if (inputId[0] != L'\0')
+    {
+        SelectDeviceById(
+            g_hComboInput,
+            g_inputDeviceIds,
+            inputId
+        );
+    }
+
+    if (outputId[0] != L'\0')
+    {
+        SelectDeviceById(
+            g_hComboOutput,
+            g_outputDeviceIds,
+            outputId
+        );
+    }
+
+    int running = GetPrivateProfileIntW(
+        L"Audio",
+        L"Running",
+        0,
+        g_configPath.c_str()
+    );
+
+    return running != 0;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
@@ -1377,8 +1618,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     return (int) msg.wParam;
 }
-
-
 
 //
 //  함수: MyRegisterClass()
@@ -1450,8 +1689,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     switch (message)
     {
     case WM_CREATE:
+    {
         CreateMainControls(hWnd);
+        AddTrayIcon(hWnd);
+
+        g_configPath = GetConfigPath();
+
+        bool shouldStart =
+            LoadSettings();
+
+        if (shouldStart)
+        {
+            StartAudioRouting(hWnd);
+        }
+
         break;
+    }
     case WM_COMMAND:
         {
             int wmId = LOWORD(wParam);
@@ -1469,6 +1722,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 {
                     StopAudioRouting();
                     SetControlsRunning(false);
+
+                    SaveSettings(false);
                 }
                 else
                 {
@@ -1477,7 +1732,42 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     if (!ValidateOutputDevice(hWnd))
                         break;
                     StartAudioRouting(hWnd);
+
+                    SaveSettings(true);
                 }
+                break;
+            case ID_TRAY_OPEN:
+                RestoreFromTray(hWnd);
+                break;
+
+            case ID_TRAY_STARTSTOP:
+                if (g_audioRunning)
+                {
+                    StopAudioRouting();
+                    SetControlsRunning(false);
+
+                    SaveSettings(false);
+                }
+                else
+                {
+                    if (!ValidateInputDevice(hWnd))
+                        break;
+                    if (!ValidateOutputDevice(hWnd))
+                        break;
+                    StartAudioRouting(hWnd);
+
+                    SaveSettings(true);
+                }
+                break;
+            case IDC_COMBO_INPUT:
+            case IDC_COMBO_OUTPUT:
+                if (HIWORD(wParam) == CBN_SELCHANGE)
+                {
+                    SaveSettings(g_audioRunning);
+                }
+                break;
+            case ID_TRAY_EXIT:
+                DestroyWindow(hWnd);
                 break;
             default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
@@ -1511,10 +1801,39 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             EndPaint(hWnd, &ps);
         }
         break;
+    case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED)
+        {
+            HideToTray(hWnd);
+            return 0;
+        }
+        break;
+    case WM_TRAYICON:
+        switch (lParam)
+        {
+        case WM_LBUTTONDBLCLK:
+            RestoreFromTray(hWnd);
+            break;
+
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            ShowTrayMenu(hWnd);
+            break;
+        }
+
+        break;
     case WM_DESTROY:
+    {
+        bool wasRunning = g_audioRunning;
+
+        SaveSettings(wasRunning);
+
         StopAudioRouting();
+        RemoveTrayIcon();
+
         PostQuitMessage(0);
         break;
+    }
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
     }
