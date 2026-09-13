@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="RearAudioRouter/RearAudioRouter.vcxproj" Id="91f27843-579e-4bc0-a903-e36af3283b0c" />
+</Solution>

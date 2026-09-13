@@ -1,0 +1,1542 @@
+﻿// RearAudioRouter.cpp : 애플리케이션에 대한 진입점을 정의합니다.
+//
+
+#include "framework.h"
+#include "RearAudioRouter.h"
+#include <commctrl.h>
+
+#include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propvarutil.h>
+
+#include <string>
+#include <vector>
+
+#include <audioclient.h>
+#include <mmreg.h>
+#include <ksmedia.h>
+#include <bit>
+
+#include <thread>
+#include <atomic>
+#include <deque>
+#include <algorithm>
+
+#pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Ole32.lib")
+
+#define IDC_COMBO_INPUT     1001
+#define IDC_COMBO_OUTPUT    1002
+#define IDC_RADIO_REAR      1003
+#define IDC_BUTTON_START    1004
+
+#define MAX_LOADSTRING 100
+
+#define WM_AUDIO_STOPPED (WM_APP + 1)
+
+// 전역 변수:
+HINSTANCE hInst;                                // 현재 인스턴스입니다.
+WCHAR szTitle[MAX_LOADSTRING];                  // 제목 표시줄 텍스트입니다.
+WCHAR szWindowClass[MAX_LOADSTRING];            // 기본 창 클래스 이름입니다.
+
+HWND g_hComboInput = nullptr;
+HWND g_hComboOutput = nullptr;
+HWND g_hRadioRear = nullptr;
+HWND g_hButtonStart = nullptr;
+
+std::vector<std::wstring> g_inputDeviceIds;
+std::vector<std::wstring> g_outputDeviceIds;
+
+std::thread g_audioThread;
+std::atomic<bool> g_audioRunning = false;
+
+// 이 코드 모듈에 포함된 함수의 선언을 전달합니다:
+ATOM                MyRegisterClass(HINSTANCE hInstance);
+BOOL                InitInstance(HINSTANCE, int);
+LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
+INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
+
+void SetControlsRunning(bool running)
+{
+    EnableWindow(g_hComboInput, !running);
+    EnableWindow(g_hComboOutput, !running);
+    EnableWindow(g_hRadioRear, !running);
+
+    SetWindowText(
+        g_hButtonStart,
+        running ? L"Stop" : L"Start"
+    );
+}
+
+int GetChannelIndex(DWORD channelMask, DWORD speaker)
+{
+    if ((channelMask & speaker) == 0)
+        return -1;
+
+    int index = 0;
+
+    for (DWORD bit = 1; bit < speaker; bit <<= 1)
+    {
+        if (channelMask & bit)
+            ++index;
+    }
+
+    return index;
+}
+
+bool ValidateOutputDevice(HWND hWnd)
+{
+    int selectedIndex = (int)SendMessage(
+        g_hComboOutput,
+        CB_GETCURSEL,
+        0,
+        0
+    );
+
+    if (selectedIndex == CB_ERR ||
+        selectedIndex < 0 ||
+        selectedIndex >= (int)g_outputDeviceIds.size())
+    {
+        MessageBox(
+            hWnd,
+            L"출력 장치를 선택해 주세요.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        nullptr,
+        CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(&enumerator)
+    );
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            hWnd,
+            L"오디오 장치 열거기를 생성하지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    IMMDevice* device = nullptr;
+
+    hr = enumerator->GetDevice(
+        g_outputDeviceIds[selectedIndex].c_str(),
+        &device
+    );
+
+    enumerator->Release();
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            hWnd,
+            L"선택한 출력 장치를 열 수 없습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    IAudioClient* audioClient = nullptr;
+
+    hr = device->Activate(
+        __uuidof(IAudioClient),
+        CLSCTX_ALL,
+        nullptr,
+        reinterpret_cast<void**>(&audioClient)
+    );
+
+    device->Release();
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            hWnd,
+            L"WASAPI 오디오 클라이언트를 생성하지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    WAVEFORMATEX* mixFormat = nullptr;
+
+    hr = audioClient->GetMixFormat(&mixFormat);
+
+    if (FAILED(hr))
+    {
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            L"출력 장치의 오디오 형식을 가져오지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    WORD channelCount = mixFormat->nChannels;
+
+    if (channelCount < 4)
+    {
+        wchar_t message[256];
+
+        swprintf_s(
+            message,
+            L"이 장치는 현재 %u채널로 설정되어 있습니다.\n\n"
+            L"RearAudioRouter는 4채널 이상의 출력 장치가 필요합니다.",
+            channelCount
+        );
+
+        CoTaskMemFree(mixFormat);
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            message,
+            L"RearAudioRouter",
+            MB_OK | MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    if (mixFormat->wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
+        mixFormat->cbSize < 22)
+    {
+        CoTaskMemFree(mixFormat);
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            L"이 장치에서 멀티채널 스피커 위치 정보를 가져올 수 없습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    WAVEFORMATEXTENSIBLE* extensible =
+        reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFormat);
+
+    DWORD channelMask = extensible->dwChannelMask;
+
+    int rearLeftIndex =
+        GetChannelIndex(channelMask, SPEAKER_BACK_LEFT);
+
+    int rearRightIndex =
+        GetChannelIndex(channelMask, SPEAKER_BACK_RIGHT);
+
+    if (rearLeftIndex < 0 || rearRightIndex < 0)
+    {
+        wchar_t message[256];
+
+        swprintf_s(
+            message,
+            L"이 장치는 %u채널이지만 Rear L/R 채널이 없습니다.\n\n"
+            L"Channel Mask: 0x%08X",
+            channelCount,
+            channelMask
+        );
+
+        CoTaskMemFree(mixFormat);
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            message,
+            L"RearAudioRouter",
+            MB_OK | MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    //
+    // 실제 Shared Mode 초기화 테스트
+    //
+    hr = audioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        0,
+        0,
+        0,
+        mixFormat,
+        nullptr
+    );
+
+    if (FAILED(hr))
+    {
+        wchar_t message[256];
+
+        swprintf_s(
+            message,
+            L"WASAPI Shared Mode로 장치를 열지 못했습니다.\n\n"
+            L"HRESULT: 0x%08X",
+            (unsigned int)hr
+        );
+
+        CoTaskMemFree(mixFormat);
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            message,
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    wchar_t message[512];
+
+    swprintf_s(
+        message,
+        L"출력 장치 검증 성공\n\n"
+        L"Channels: %u\n"
+        L"Sample Rate: %u Hz\n"
+        L"Bits: %u\n"
+        L"Channel Mask: 0x%08X\n\n"
+        L"Rear Left : Channel %d\n"
+        L"Rear Right: Channel %d\n\n"
+        L"WASAPI Shared Mode: OK",
+        channelCount,
+        mixFormat->nSamplesPerSec,
+        mixFormat->wBitsPerSample,
+        channelMask,
+        rearLeftIndex + 1,
+        rearRightIndex + 1
+    );
+
+    CoTaskMemFree(mixFormat);
+    audioClient->Release();
+
+    MessageBox(
+        hWnd,
+        message,
+        L"RearAudioRouter",
+        MB_OK | MB_ICONINFORMATION
+    );
+
+    return true;
+}
+
+bool ValidateInputDevice(HWND hWnd)
+{
+    int selectedIndex = (int)SendMessage(
+        g_hComboInput,
+        CB_GETCURSEL,
+        0,
+        0
+    );
+
+    if (selectedIndex == CB_ERR ||
+        selectedIndex < 0 ||
+        selectedIndex >= (int)g_inputDeviceIds.size())
+    {
+        MessageBox(
+            hWnd,
+            L"입력 장치를 선택해 주세요.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        nullptr,
+        CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(&enumerator)
+    );
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            hWnd,
+            L"오디오 장치 열거기를 생성하지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    IMMDevice* device = nullptr;
+
+    hr = enumerator->GetDevice(
+        g_inputDeviceIds[selectedIndex].c_str(),
+        &device
+    );
+
+    enumerator->Release();
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            hWnd,
+            L"선택한 입력 장치를 열 수 없습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    IAudioClient* audioClient = nullptr;
+
+    hr = device->Activate(
+        __uuidof(IAudioClient),
+        CLSCTX_ALL,
+        nullptr,
+        reinterpret_cast<void**>(&audioClient)
+    );
+
+    device->Release();
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            hWnd,
+            L"입력 장치의 WASAPI 오디오 클라이언트를 생성하지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    WAVEFORMATEX* mixFormat = nullptr;
+
+    hr = audioClient->GetMixFormat(&mixFormat);
+
+    if (FAILED(hr))
+    {
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            L"입력 장치의 오디오 형식을 가져오지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    if (mixFormat->nChannels < 2)
+    {
+        wchar_t message[256];
+
+        swprintf_s(
+            message,
+            L"입력 장치가 %u채널입니다.\n\n"
+            L"RearAudioRouter는 최소 2채널 입력이 필요합니다.",
+            mixFormat->nChannels
+        );
+
+        CoTaskMemFree(mixFormat);
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            message,
+            L"RearAudioRouter",
+            MB_OK | MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    //
+    // Shared Capture 초기화 테스트
+    //
+    hr = audioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        0,
+        0,
+        0,
+        mixFormat,
+        nullptr
+    );
+
+    if (FAILED(hr))
+    {
+        wchar_t message[256];
+
+        swprintf_s(
+            message,
+            L"WASAPI Shared Capture로 입력 장치를 열지 못했습니다.\n\n"
+            L"HRESULT: 0x%08X",
+            (unsigned int)hr
+        );
+
+        CoTaskMemFree(mixFormat);
+        audioClient->Release();
+
+        MessageBox(
+            hWnd,
+            message,
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    wchar_t message[512];
+
+    swprintf_s(
+        message,
+        L"입력 장치 검증 성공\n\n"
+        L"Channels: %u\n"
+        L"Sample Rate: %u Hz\n"
+        L"Bits: %u\n"
+        L"Block Align: %u bytes\n\n"
+        L"WASAPI Shared Capture: OK",
+        mixFormat->nChannels,
+        mixFormat->nSamplesPerSec,
+        mixFormat->wBitsPerSample,
+        mixFormat->nBlockAlign
+    );
+
+    CoTaskMemFree(mixFormat);
+    audioClient->Release();
+
+    MessageBox(
+        hWnd,
+        message,
+        L"RearAudioRouter",
+        MB_OK | MB_ICONINFORMATION
+    );
+
+    return true;
+}
+
+std::wstring GetDeviceFriendlyName(IMMDevice* device)
+{
+    IPropertyStore* propertyStore = nullptr;
+
+    HRESULT hr = device->OpenPropertyStore(
+        STGM_READ,
+        &propertyStore
+    );
+
+    if (FAILED(hr))
+        return L"(Unknown device)";
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+
+    hr = propertyStore->GetValue(
+        PKEY_Device_FriendlyName,
+        &value
+    );
+
+    std::wstring name = L"(Unknown device)";
+
+    if (SUCCEEDED(hr) &&
+        value.vt == VT_LPWSTR &&
+        value.pwszVal != nullptr)
+    {
+        name = value.pwszVal;
+    }
+
+    PropVariantClear(&value);
+    propertyStore->Release();
+
+    return name;
+}
+
+void EnumerateAudioDevices(
+    EDataFlow dataFlow,
+    HWND comboBox,
+    std::vector<std::wstring>& deviceIds)
+{
+    SendMessage(comboBox, CB_RESETCONTENT, 0, 0);
+    deviceIds.clear();
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        nullptr,
+        CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),
+        reinterpret_cast<void**>(&enumerator)
+    );
+
+    if (FAILED(hr))
+        return;
+
+    IMMDeviceCollection* collection = nullptr;
+
+    hr = enumerator->EnumAudioEndpoints(
+        dataFlow,
+        DEVICE_STATE_ACTIVE,
+        &collection
+    );
+
+    if (FAILED(hr))
+    {
+        enumerator->Release();
+        return;
+    }
+
+    UINT count = 0;
+    collection->GetCount(&count);
+
+    for (UINT i = 0; i < count; ++i)
+    {
+        IMMDevice* device = nullptr;
+
+        if (FAILED(collection->Item(i, &device)))
+            continue;
+
+        LPWSTR deviceId = nullptr;
+
+        if (SUCCEEDED(device->GetId(&deviceId)))
+        {
+            std::wstring name = GetDeviceFriendlyName(device);
+
+            SendMessage(
+                comboBox,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(name.c_str())
+            );
+
+            deviceIds.emplace_back(deviceId);
+
+            CoTaskMemFree(deviceId);
+        }
+
+        device->Release();
+    }
+
+    collection->Release();
+    enumerator->Release();
+
+    if (count > 0)
+    {
+        SendMessage(comboBox, CB_SETCURSEL, 0, 0);
+    }
+}
+
+void AudioThreadProc(
+    HWND hWnd,
+    std::wstring inputDeviceId,
+    std::wstring outputDeviceId)
+{
+    HRESULT hr = CoInitializeEx(
+        nullptr,
+        COINIT_MULTITHREADED
+    );
+
+    if (FAILED(hr))
+    {
+        PostMessage(hWnd, WM_AUDIO_STOPPED, 1, 0);
+        return;
+    }
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* inputDevice = nullptr;
+    IMMDevice* outputDevice = nullptr;
+
+    IAudioClient* inputClient = nullptr;
+    IAudioClient* outputClient = nullptr;
+
+    IAudioCaptureClient* captureClient = nullptr;
+    IAudioRenderClient* renderClient = nullptr;
+
+    WAVEFORMATEX* outputFormat = nullptr;
+
+    bool inputStarted = false;
+    bool outputStarted = false;
+
+    do
+    {
+        //
+        // Device Enumerator
+        //
+        hr = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator),
+            nullptr,
+            CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator),
+            reinterpret_cast<void**>(&enumerator)
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // Input device
+        //
+        hr = enumerator->GetDevice(
+            inputDeviceId.c_str(),
+            &inputDevice
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // Output device
+        //
+        hr = enumerator->GetDevice(
+            outputDeviceId.c_str(),
+            &outputDevice
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // Audio clients
+        //
+        hr = inputDevice->Activate(
+            __uuidof(IAudioClient),
+            CLSCTX_ALL,
+            nullptr,
+            reinterpret_cast<void**>(&inputClient)
+        );
+
+        if (FAILED(hr))
+            break;
+
+        hr = outputDevice->Activate(
+            __uuidof(IAudioClient),
+            CLSCTX_ALL,
+            nullptr,
+            reinterpret_cast<void**>(&outputClient)
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // Output Mix Format
+        //
+        hr = outputClient->GetMixFormat(
+            &outputFormat
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // 현재 첫 버전에서는 출력 Mix Format이
+        // 32-bit float인 경우만 처리한다.
+        //
+        if (outputFormat->wFormatTag != WAVE_FORMAT_EXTENSIBLE)
+        {
+            hr = E_FAIL;
+            break;
+        }
+
+        WAVEFORMATEXTENSIBLE* outputExt =
+            reinterpret_cast<WAVEFORMATEXTENSIBLE*>(
+                outputFormat
+                );
+
+        if (!IsEqualGUID(
+            outputExt->SubFormat,
+            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))
+        {
+            hr = E_FAIL;
+            break;
+        }
+
+        DWORD channelMask = outputExt->dwChannelMask;
+
+        int rearLeft =
+            GetChannelIndex(
+                channelMask,
+                SPEAKER_BACK_LEFT
+            );
+
+        int rearRight =
+            GetChannelIndex(
+                channelMask,
+                SPEAKER_BACK_RIGHT
+            );
+
+        if (rearLeft < 0 || rearRight < 0)
+        {
+            hr = E_FAIL;
+            break;
+        }
+
+        const UINT32 outputChannels =
+            outputFormat->nChannels;
+
+        //
+        // 입력은 항상:
+        //
+        // 2ch
+        // 출력과 동일한 Sample Rate
+        // Float32
+        //
+        WAVEFORMATEXTENSIBLE inputFormat = {};
+
+        inputFormat.Format.wFormatTag =
+            WAVE_FORMAT_EXTENSIBLE;
+
+        inputFormat.Format.nChannels = 2;
+
+        inputFormat.Format.nSamplesPerSec =
+            outputFormat->nSamplesPerSec;
+
+        inputFormat.Format.wBitsPerSample = 32;
+
+        inputFormat.Format.nBlockAlign =
+            2 * sizeof(float);
+
+        inputFormat.Format.nAvgBytesPerSec =
+            inputFormat.Format.nSamplesPerSec *
+            inputFormat.Format.nBlockAlign;
+
+        inputFormat.Format.cbSize =
+            sizeof(WAVEFORMATEXTENSIBLE) -
+            sizeof(WAVEFORMATEX);
+
+        inputFormat.Samples.wValidBitsPerSample =
+            32;
+
+        inputFormat.dwChannelMask =
+            SPEAKER_FRONT_LEFT |
+            SPEAKER_FRONT_RIGHT;
+
+        inputFormat.SubFormat =
+            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+        //
+        // Input Shared Capture
+        //
+        DWORD inputFlags =
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+        hr = inputClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            inputFlags,
+            0,
+            0,
+            &inputFormat.Format,
+            nullptr
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // Output Shared Render
+        //
+        hr = outputClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            0,
+            0,
+            0,
+            outputFormat,
+            nullptr
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // WASAPI service interfaces
+        //
+        hr = inputClient->GetService(
+            __uuidof(IAudioCaptureClient),
+            reinterpret_cast<void**>(&captureClient)
+        );
+
+        if (FAILED(hr))
+            break;
+
+        hr = outputClient->GetService(
+            __uuidof(IAudioRenderClient),
+            reinterpret_cast<void**>(&renderClient)
+        );
+
+        if (FAILED(hr))
+            break;
+
+        UINT32 outputBufferFrames = 0;
+
+        hr = outputClient->GetBufferSize(
+            &outputBufferFrames
+        );
+
+        if (FAILED(hr))
+            break;
+
+        //
+        // 간단한 stereo FIFO
+        //
+        std::deque<float> audioQueue;
+
+        //
+        // Output 먼저 시작
+        //
+        hr = outputClient->Start();
+
+        if (FAILED(hr))
+            break;
+
+        outputStarted = true;
+
+        hr = inputClient->Start();
+
+        if (FAILED(hr))
+            break;
+
+        inputStarted = true;
+
+        //
+        // Main audio loop
+        //
+        while (g_audioRunning)
+        {
+            //
+            // --------------------------------
+            // Capture
+            // --------------------------------
+            //
+            UINT32 packetFrames = 0;
+
+            hr = captureClient->GetNextPacketSize(
+                &packetFrames
+            );
+
+            if (FAILED(hr))
+                break;
+
+            while (packetFrames > 0)
+            {
+                BYTE* data = nullptr;
+                UINT32 frames = 0;
+                DWORD flags = 0;
+
+                hr = captureClient->GetBuffer(
+                    &data,
+                    &frames,
+                    &flags,
+                    nullptr,
+                    nullptr
+                );
+
+                if (FAILED(hr))
+                    break;
+
+                bool silent =
+                    (flags &
+                        AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+
+                if (silent)
+                {
+                    for (UINT32 i = 0; i < frames; ++i)
+                    {
+                        audioQueue.push_back(0.0f);
+                        audioQueue.push_back(0.0f);
+                    }
+                }
+                else
+                {
+                    float* input =
+                        reinterpret_cast<float*>(data);
+
+                    for (UINT32 i = 0; i < frames; ++i)
+                    {
+                        float left =
+                            input[i * 2];
+
+                        float right =
+                            input[i * 2 + 1];
+
+                        audioQueue.push_back(left);
+                        audioQueue.push_back(right);
+                    }
+                }
+
+                captureClient->ReleaseBuffer(
+                    frames
+                );
+
+                hr = captureClient->GetNextPacketSize(
+                    &packetFrames
+                );
+
+                if (FAILED(hr))
+                    break;
+            }
+
+            if (FAILED(hr))
+                break;
+
+            //
+            // --------------------------------
+            // Render
+            // --------------------------------
+            //
+            UINT32 padding = 0;
+
+            hr = outputClient->GetCurrentPadding(
+                &padding
+            );
+
+            if (FAILED(hr))
+                break;
+
+            UINT32 availableFrames =
+                outputBufferFrames - padding;
+
+            if (availableFrames > 0)
+            {
+                BYTE* outputData = nullptr;
+
+                hr = renderClient->GetBuffer(
+                    availableFrames,
+                    &outputData
+                );
+
+                if (FAILED(hr))
+                    break;
+
+                float* output =
+                    reinterpret_cast<float*>(
+                        outputData
+                        );
+
+                //
+                // 전체 출력 버퍼를 먼저 0으로
+                //
+                std::fill(
+                    output,
+                    output +
+                    (
+                        static_cast<size_t>(
+                            availableFrames
+                            ) *
+                        outputChannels
+                        ),
+                    0.0f
+                );
+
+                for (
+                    UINT32 frame = 0;
+                    frame < availableFrames;
+                    ++frame)
+                {
+                    float left = 0.0f;
+                    float right = 0.0f;
+
+                    //
+                    // stereo 한 프레임이 준비됐다면 사용
+                    //
+                    if (audioQueue.size() >= 2)
+                    {
+                        left =
+                            audioQueue.front();
+
+                        audioQueue.pop_front();
+
+                        right =
+                            audioQueue.front();
+
+                        audioQueue.pop_front();
+                    }
+
+                    float* currentFrame =
+                        output +
+                        (
+                            static_cast<size_t>(frame) *
+                            outputChannels
+                            );
+
+                    currentFrame[rearLeft] =
+                        left;
+
+                    currentFrame[rearRight] =
+                        right;
+                }
+
+                hr = renderClient->ReleaseBuffer(
+                    availableFrames,
+                    0
+                );
+
+                if (FAILED(hr))
+                    break;
+            }
+
+            //
+            // 첫 버전에서는 짧게 polling
+            //
+            Sleep(2);
+        }
+
+    } while (false);
+
+    //
+    // Cleanup
+    //
+    if (inputStarted)
+        inputClient->Stop();
+
+    if (outputStarted)
+        outputClient->Stop();
+
+    if (captureClient)
+        captureClient->Release();
+
+    if (renderClient)
+        renderClient->Release();
+
+    if (inputClient)
+        inputClient->Release();
+
+    if (outputClient)
+        outputClient->Release();
+
+    if (inputDevice)
+        inputDevice->Release();
+
+    if (outputDevice)
+        outputDevice->Release();
+
+    if (enumerator)
+        enumerator->Release();
+
+    if (outputFormat)
+        CoTaskMemFree(outputFormat);
+
+    CoUninitialize();
+
+    g_audioRunning = false;
+
+    PostMessage(
+        hWnd,
+        WM_AUDIO_STOPPED,
+        FAILED(hr) ? 1 : 0,
+        0
+    );
+}
+
+void StartAudioRouting(HWND hWnd)
+{
+    int inputIndex = (int)SendMessage(
+        g_hComboInput,
+        CB_GETCURSEL,
+        0,
+        0
+    );
+
+    int outputIndex = (int)SendMessage(
+        g_hComboOutput,
+        CB_GETCURSEL,
+        0,
+        0
+    );
+
+    if (inputIndex == CB_ERR ||
+        outputIndex == CB_ERR)
+    {
+        return;
+    }
+
+    if (inputIndex < 0 ||
+        inputIndex >= (int)g_inputDeviceIds.size() ||
+        outputIndex < 0 ||
+        outputIndex >= (int)g_outputDeviceIds.size())
+    {
+        return;
+    }
+
+    std::wstring inputId =
+        g_inputDeviceIds[inputIndex];
+
+    std::wstring outputId =
+        g_outputDeviceIds[outputIndex];
+
+    g_audioRunning = true;
+
+    SetControlsRunning(true);
+
+    g_audioThread = std::thread(
+        AudioThreadProc,
+        hWnd,
+        inputId,
+        outputId
+    );
+}
+
+void StopAudioRouting()
+{
+    if (!g_audioRunning)
+        return;
+
+    g_audioRunning = false;
+
+    if (g_audioThread.joinable())
+        g_audioThread.join();
+}
+
+void CreateMainControls(HWND hWnd)
+{
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    // Input label
+    HWND hInputLabel = CreateWindow(
+        L"STATIC",
+        L"Input",
+        WS_CHILD | WS_VISIBLE,
+        20, 20, 200, 20,
+        hWnd,
+        nullptr,
+        nullptr,
+        nullptr);
+
+    // Input combo
+    g_hComboInput = CreateWindow(
+        L"COMBOBOX",
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        CBS_DROPDOWNLIST | WS_VSCROLL,
+        20, 45, 340, 200,
+        hWnd,
+        (HMENU)IDC_COMBO_INPUT,
+        nullptr,
+        nullptr);
+
+    // Output label
+    HWND hOutputLabel = CreateWindow(
+        L"STATIC",
+        L"Output",
+        WS_CHILD | WS_VISIBLE,
+        20, 90, 200, 20,
+        hWnd,
+        nullptr,
+        nullptr,
+        nullptr);
+
+    // Output combo
+    g_hComboOutput = CreateWindow(
+        L"COMBOBOX",
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        CBS_DROPDOWNLIST | WS_VSCROLL,
+        20, 115, 340, 200,
+        hWnd,
+        (HMENU)IDC_COMBO_OUTPUT,
+        nullptr,
+        nullptr);
+
+    // Destination label
+    HWND hDestinationLabel = CreateWindow(
+        L"STATIC",
+        L"Destination",
+        WS_CHILD | WS_VISIBLE,
+        20, 165, 200, 20,
+        hWnd,
+        nullptr,
+        nullptr,
+        nullptr);
+
+    // Rear L/R radio button
+    g_hRadioRear = CreateWindow(
+        L"BUTTON",
+        L"Rear L/R",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        BS_AUTORADIOBUTTON,
+        20, 190, 150, 24,
+        hWnd,
+        (HMENU)IDC_RADIO_REAR,
+        nullptr,
+        nullptr);
+
+    SendMessage(g_hRadioRear, BM_SETCHECK, BST_CHECKED, 0);
+
+    // Start button
+    g_hButtonStart = CreateWindow(
+        L"BUTTON",
+        L"Start",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        BS_PUSHBUTTON,
+        260, 235, 100, 32,
+        hWnd,
+        (HMENU)IDC_BUTTON_START,
+        nullptr,
+        nullptr);
+
+    HWND controls[] =
+    {
+        hInputLabel,
+        g_hComboInput,
+        hOutputLabel,
+        g_hComboOutput,
+        hDestinationLabel,
+        g_hRadioRear,
+        g_hButtonStart
+    };
+
+    for (HWND control : controls)
+    {
+        SendMessage(control, WM_SETFONT, (WPARAM)hFont, TRUE);
+    }
+
+    EnumerateAudioDevices(
+        eCapture,
+        g_hComboInput,
+        g_inputDeviceIds
+    );
+
+    EnumerateAudioDevices(
+        eRender,
+        g_hComboOutput,
+        g_outputDeviceIds
+    );
+}
+
+int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
+                     _In_opt_ HINSTANCE hPrevInstance,
+                     _In_ LPWSTR    lpCmdLine,
+                     _In_ int       nCmdShow)
+{
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
+
+    // TODO: 여기에 코드를 입력합니다.
+
+    HRESULT hr = CoInitializeEx(
+        nullptr,
+        COINIT_APARTMENTTHREADED
+    );
+
+    if (FAILED(hr))
+    {
+        MessageBox(
+            nullptr,
+            L"COM initialization failed.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return 0;
+    }
+
+    // 전역 문자열을 초기화합니다.
+    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
+    LoadStringW(hInstance, IDC_REARAUDIOROUTER, szWindowClass, MAX_LOADSTRING);
+    MyRegisterClass(hInstance);
+
+    // 애플리케이션 초기화를 수행합니다:
+    if (!InitInstance (hInstance, nCmdShow))
+    {
+        return FALSE;
+    }
+
+    HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_REARAUDIOROUTER));
+
+    MSG msg;
+
+    // 기본 메시지 루프입니다:
+    while (GetMessage(&msg, nullptr, 0, 0))
+    {
+        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    CoUninitialize();
+
+    return (int) msg.wParam;
+}
+
+
+
+//
+//  함수: MyRegisterClass()
+//
+//  용도: 창 클래스를 등록합니다.
+//
+ATOM MyRegisterClass(HINSTANCE hInstance)
+{
+    WNDCLASSEXW wcex;
+
+    wcex.cbSize = sizeof(WNDCLASSEX);
+
+    wcex.style          = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc    = WndProc;
+    wcex.cbClsExtra     = 0;
+    wcex.cbWndExtra     = 0;
+    wcex.hInstance      = hInstance;
+    wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_REARAUDIOROUTER));
+    wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground  = (HBRUSH)(COLOR_BTNFACE+1);
+ // wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_REARAUDIOROUTER);
+    wcex.lpszMenuName   = nullptr;
+    wcex.lpszClassName  = szWindowClass;
+    wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
+
+    return RegisterClassExW(&wcex);
+}
+
+//
+//   함수: InitInstance(HINSTANCE, int)
+//
+//   용도: 인스턴스 핸들을 저장하고 주 창을 만듭니다.
+//
+//   주석:
+//
+//        이 함수를 통해 인스턴스 핸들을 전역 변수에 저장하고
+//        주 프로그램 창을 만든 다음 표시합니다.
+//
+BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
+{
+   hInst = hInstance; // 인스턴스 핸들을 전역 변수에 저장합니다.
+
+   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, CW_USEDEFAULT, 400, 340, nullptr, nullptr, hInstance, nullptr);
+
+   if (!hWnd)
+   {
+      return FALSE;
+   }
+
+   ShowWindow(hWnd, nCmdShow);
+   UpdateWindow(hWnd);
+
+   return TRUE;
+}
+
+//
+//  함수: WndProc(HWND, UINT, WPARAM, LPARAM)
+//
+//  용도: 주 창의 메시지를 처리합니다.
+//
+//  WM_COMMAND  - 애플리케이션 메뉴를 처리합니다.
+//  WM_PAINT    - 주 창을 그립니다.
+//  WM_DESTROY  - 종료 메시지를 게시하고 반환합니다.
+//
+//
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_CREATE:
+        CreateMainControls(hWnd);
+        break;
+    case WM_COMMAND:
+        {
+            int wmId = LOWORD(wParam);
+            // 메뉴 선택을 구문 분석합니다:
+            switch (wmId)
+            {
+            case IDM_ABOUT:
+                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+                break;
+            case IDM_EXIT:
+                DestroyWindow(hWnd);
+                break;
+            case IDC_BUTTON_START:
+                if (g_audioRunning)
+                {
+                    StopAudioRouting();
+                    SetControlsRunning(false);
+                }
+                else
+                {
+                    if (!ValidateInputDevice(hWnd))
+                        break;
+                    if (!ValidateOutputDevice(hWnd))
+                        break;
+                    StartAudioRouting(hWnd);
+                }
+                break;
+            default:
+                return DefWindowProc(hWnd, message, wParam, lParam);
+            }
+        }
+        break;
+    case WM_AUDIO_STOPPED:
+    {
+        if (g_audioThread.joinable())
+            g_audioThread.join();
+
+        SetControlsRunning(false);
+
+        if (wParam != 0)
+        {
+            MessageBox(
+                hWnd,
+                L"오디오 스트림이 예기치 않게 종료되었습니다.",
+                L"RearAudioRouter",
+                MB_OK | MB_ICONERROR
+            );
+        }
+
+        break;
+    }
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            BeginPaint(hWnd, &ps);
+            // TODO: 여기에 그리기 코드를 추가합니다...
+            EndPaint(hWnd, &ps);
+        }
+        break;
+    case WM_DESTROY:
+        StopAudioRouting();
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+// 정보 대화 상자의 메시지 처리기입니다.
+INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    UNREFERENCED_PARAMETER(lParam);
+    switch (message)
+    {
+    case WM_INITDIALOG:
+        return (INT_PTR)TRUE;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, LOWORD(wParam));
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
