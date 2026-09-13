@@ -19,16 +19,20 @@
 
 #include <thread>
 #include <atomic>
-#include <deque>
 #include <algorithm>
 
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include <avrt.h>
+
+
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Ole32.lib")
 
 #pragma comment(lib, "Shell32.lib")
+
+#pragma comment(lib, "Avrt.lib")
 
 #define IDC_COMBO_INPUT     1001
 #define IDC_COMBO_OUTPUT    1002
@@ -64,6 +68,8 @@ std::atomic<bool> g_audioRunning = false;
 NOTIFYICONDATA g_nid = {};
 
 std::wstring g_configPath;
+
+HANDLE g_audioStopEvent = nullptr;
 
 // 이 코드 모듈에 포함된 함수의 선언을 전달합니다:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -320,8 +326,6 @@ bool ValidateOutputDevice(HWND hWnd)
         return false;
     }
 
-    wchar_t message[512];
-
     CoTaskMemFree(mixFormat);
     audioClient->Release();
 
@@ -495,8 +499,6 @@ bool ValidateInputDevice(HWND hWnd)
         return false;
     }
 
-    wchar_t message[512];
-
     CoTaskMemFree(mixFormat);
     audioClient->Release();
 
@@ -625,11 +627,15 @@ void AudioThreadProc(
 
     if (FAILED(hr))
     {
+        g_audioRunning = false;
         PostMessage(hWnd, WM_AUDIO_STOPPED, 1, 0);
         return;
     }
 
+    bool hadError = false;
+
     IMMDeviceEnumerator* enumerator = nullptr;
+
     IMMDevice* inputDevice = nullptr;
     IMMDevice* outputDevice = nullptr;
 
@@ -641,13 +647,29 @@ void AudioThreadProc(
 
     WAVEFORMATEX* outputFormat = nullptr;
 
+    HANDLE captureEvent = nullptr;
+    HANDLE renderEvent = nullptr;
+
+    HANDLE mmcssHandle = nullptr;
+    DWORD mmcssTaskIndex = 0;
+
     bool inputStarted = false;
     bool outputStarted = false;
+
+    //
+    // 오디오 스레드를 MMCSS의 Pro Audio 작업으로 등록
+    //
+    mmcssHandle = AvSetMmThreadCharacteristicsW(
+        L"Pro Audio",
+        &mmcssTaskIndex
+    );
 
     do
     {
         //
-        // Device Enumerator
+        // ------------------------------------------------
+        // 장치 열기
+        // ------------------------------------------------
         //
         hr = CoCreateInstance(
             __uuidof(MMDeviceEnumerator),
@@ -658,33 +680,33 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
-        //
-        // Input device
-        //
         hr = enumerator->GetDevice(
             inputDeviceId.c_str(),
             &inputDevice
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
-        //
-        // Output device
-        //
         hr = enumerator->GetDevice(
             outputDeviceId.c_str(),
             &outputDevice
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
-        //
-        // Audio clients
-        //
         hr = inputDevice->Activate(
             __uuidof(IAudioClient),
             CLSCTX_ALL,
@@ -693,7 +715,10 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
         hr = outputDevice->Activate(
             __uuidof(IAudioClient),
@@ -703,25 +728,30 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
         //
-        // Output Mix Format
+        // ------------------------------------------------
+        // 출력 Mix Format
+        // ------------------------------------------------
         //
         hr = outputClient->GetMixFormat(
             &outputFormat
         );
 
         if (FAILED(hr))
-            break;
-
-        //
-        // 현재 첫 버전에서는 출력 Mix Format이
-        // 32-bit float인 경우만 처리한다.
-        //
-        if (outputFormat->wFormatTag != WAVE_FORMAT_EXTENSIBLE)
         {
-            hr = E_FAIL;
+            hadError = true;
+            break;
+        }
+
+        if (outputFormat->wFormatTag !=
+            WAVE_FORMAT_EXTENSIBLE)
+        {
+            hadError = true;
             break;
         }
 
@@ -734,11 +764,15 @@ void AudioThreadProc(
             outputExt->SubFormat,
             KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))
         {
-            hr = E_FAIL;
+            hadError = true;
             break;
         }
 
-        DWORD channelMask = outputExt->dwChannelMask;
+        const UINT32 outputChannels =
+            outputFormat->nChannels;
+
+        DWORD channelMask =
+            outputExt->dwChannelMask;
 
         int rearLeft =
             GetChannelIndex(
@@ -752,21 +786,22 @@ void AudioThreadProc(
                 SPEAKER_BACK_RIGHT
             );
 
-        if (rearLeft < 0 || rearRight < 0)
+        if (rearLeft < 0 ||
+            rearRight < 0)
         {
-            hr = E_FAIL;
+            hadError = true;
             break;
         }
 
-        const UINT32 outputChannels =
-            outputFormat->nChannels;
-
         //
-        // 입력은 항상:
+        // ------------------------------------------------
+        // 입력 형식
         //
-        // 2ch
-        // 출력과 동일한 Sample Rate
-        // Float32
+        // 항상:
+        // 출력과 동일한 sample rate
+        // stereo
+        // float32
+        // ------------------------------------------------
         //
         WAVEFORMATEXTENSIBLE inputFormat = {};
 
@@ -802,9 +837,38 @@ void AudioThreadProc(
             KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
         //
+        // ------------------------------------------------
+        // WASAPI 이벤트 생성
+        // ------------------------------------------------
+        //
+        captureEvent = CreateEvent(
+            nullptr,
+            FALSE,
+            FALSE,
+            nullptr
+        );
+
+        renderEvent = CreateEvent(
+            nullptr,
+            FALSE,
+            FALSE,
+            nullptr
+        );
+
+        if (!captureEvent ||
+            !renderEvent)
+        {
+            hadError = true;
+            break;
+        }
+
+        //
+        // ------------------------------------------------
         // Input Shared Capture
+        // ------------------------------------------------
         //
         DWORD inputFlags =
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
             AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
@@ -818,14 +882,32 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
+
+        hr = inputClient->SetEventHandle(
+            captureEvent
+        );
+
+        if (FAILED(hr))
+        {
+            hadError = true;
+            break;
+        }
 
         //
+        // ------------------------------------------------
         // Output Shared Render
+        // ------------------------------------------------
         //
+        DWORD outputFlags =
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
         hr = outputClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            0,
+            outputFlags,
             0,
             0,
             outputFormat,
@@ -833,10 +915,25 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
+
+        hr = outputClient->SetEventHandle(
+            renderEvent
+        );
+
+        if (FAILED(hr))
+        {
+            hadError = true;
+            break;
+        }
 
         //
-        // WASAPI service interfaces
+        // ------------------------------------------------
+        // Capture / Render 인터페이스
+        // ------------------------------------------------
         //
         hr = inputClient->GetService(
             __uuidof(IAudioCaptureClient),
@@ -844,7 +941,10 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
         hr = outputClient->GetService(
             __uuidof(IAudioRenderClient),
@@ -852,7 +952,10 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
         UINT32 outputBufferFrames = 0;
 
@@ -861,139 +964,422 @@ void AudioThreadProc(
         );
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
         //
-        // 간단한 stereo FIFO
+        // ------------------------------------------------
+        // 고정 크기 Stereo Ring Buffer
+        // ------------------------------------------------
         //
-        std::deque<float> audioQueue;
+        struct StereoFrame
+        {
+            float left;
+            float right;
+        };
 
         //
-        // Output 먼저 시작
+        // 500 ms 분량.
+        // 정상 동작 중에는 실제로 이렇게 많이 쌓이지 않는다.
         //
-        hr = outputClient->Start();
+        const size_t ringCapacity =
+            outputFormat->nSamplesPerSec / 2;
 
-        if (FAILED(hr))
-            break;
+        std::vector<StereoFrame> ringBuffer(
+            ringCapacity
+        );
 
-        outputStarted = true;
+        size_t ringRead = 0;
+        size_t ringWrite = 0;
+        size_t ringCount = 0;
 
+        auto PushFrame =
+            [&](float left, float right)
+            {
+                //
+                // 혹시 buffer가 가득 찼으면
+                // 가장 오래된 프레임 하나 버림.
+                //
+                if (ringCount == ringCapacity)
+                {
+                    ringRead =
+                        (ringRead + 1) %
+                        ringCapacity;
+
+                    --ringCount;
+                }
+
+                ringBuffer[ringWrite].left =
+                    left;
+
+                ringBuffer[ringWrite].right =
+                    right;
+
+                ringWrite =
+                    (ringWrite + 1) %
+                    ringCapacity;
+
+                ++ringCount;
+            };
+
+        auto PopFrame =
+            [&](StereoFrame& frame) -> bool
+            {
+                if (ringCount == 0)
+                    return false;
+
+                frame =
+                    ringBuffer[ringRead];
+
+                ringRead =
+                    (ringRead + 1) %
+                    ringCapacity;
+
+                --ringCount;
+
+                return true;
+            };
+
+        //
+        // Capture packet을 ring buffer로 모두 가져오는 함수
+        //
+        auto DrainCapture = [&]() -> bool
+            {
+                UINT32 packetFrames = 0;
+
+                HRESULT localHr =
+                    captureClient->GetNextPacketSize(
+                        &packetFrames
+                    );
+
+                if (FAILED(localHr))
+                    return false;
+
+                while (packetFrames > 0)
+                {
+                    BYTE* data = nullptr;
+                    UINT32 frames = 0;
+                    DWORD flags = 0;
+
+                    localHr =
+                        captureClient->GetBuffer(
+                            &data,
+                            &frames,
+                            &flags,
+                            nullptr,
+                            nullptr
+                        );
+
+                    if (FAILED(localHr))
+                        return false;
+
+                    bool silent =
+                        (flags &
+                            AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+
+                    if (silent)
+                    {
+                        for (UINT32 i = 0;
+                            i < frames;
+                            ++i)
+                        {
+                            PushFrame(
+                                0.0f,
+                                0.0f
+                            );
+                        }
+                    }
+                    else
+                    {
+                        float* input =
+                            reinterpret_cast<float*>(
+                                data
+                                );
+
+                        for (UINT32 i = 0;
+                            i < frames;
+                            ++i)
+                        {
+                            PushFrame(
+                                input[i * 2],
+                                input[i * 2 + 1]
+                            );
+                        }
+                    }
+
+                    localHr =
+                        captureClient->ReleaseBuffer(
+                            frames
+                        );
+
+                    if (FAILED(localHr))
+                        return false;
+
+                    localHr =
+                        captureClient->GetNextPacketSize(
+                            &packetFrames
+                        );
+
+                    if (FAILED(localHr))
+                        return false;
+                }
+
+                return true;
+            };
+
+        //
+        // ------------------------------------------------
+        // 먼저 Capture만 시작
+        // ------------------------------------------------
+        //
         hr = inputClient->Start();
 
         if (FAILED(hr))
+        {
+            hadError = true;
             break;
+        }
 
         inputStarted = true;
 
         //
-        // Main audio loop
+        // 20ms 또는 output buffer 하나 분량 중
+        // 더 큰 쪽까지 입력을 미리 모은다.
+        //
+        const size_t prebufferFrames =
+            (std::max)(
+                static_cast<size_t>(
+                    outputFormat->nSamplesPerSec / 50
+                    ),
+                static_cast<size_t>(
+                    outputBufferFrames
+                    )
+                );
+
+        while (
+            g_audioRunning &&
+            ringCount < prebufferFrames)
+        {
+            HANDLE waits[] =
+            {
+                g_audioStopEvent,
+                captureEvent
+            };
+
+            DWORD waitResult =
+                WaitForMultipleObjects(
+                    2,
+                    waits,
+                    FALSE,
+                    INFINITE
+                );
+
+            if (waitResult == WAIT_OBJECT_0)
+            {
+                //
+                // 정상 Stop
+                //
+                break;
+            }
+
+            if (waitResult ==
+                WAIT_OBJECT_0 + 1)
+            {
+                if (!DrainCapture())
+                {
+                    hadError = true;
+                    break;
+                }
+            }
+            else
+            {
+                hadError = true;
+                break;
+            }
+        }
+
+        if (!g_audioRunning ||
+            hadError)
+        {
+            break;
+        }
+
+        //
+        // ------------------------------------------------
+        // 출력 버퍼를 Rear 데이터로 미리 채움
+        // ------------------------------------------------
+        //
+        BYTE* initialData = nullptr;
+
+        hr = renderClient->GetBuffer(
+            outputBufferFrames,
+            &initialData
+        );
+
+        if (FAILED(hr))
+        {
+            hadError = true;
+            break;
+        }
+
+        float* initialOutput =
+            reinterpret_cast<float*>(
+                initialData
+                );
+
+        std::fill(
+            initialOutput,
+            initialOutput +
+            static_cast<size_t>(
+                outputBufferFrames
+                ) *
+            outputChannels,
+            0.0f
+        );
+
+        for (UINT32 frame = 0;
+            frame < outputBufferFrames;
+            ++frame)
+        {
+            StereoFrame stereo = {};
+
+            if (!PopFrame(stereo))
+                break;
+
+            float* currentFrame =
+                initialOutput +
+                static_cast<size_t>(frame) *
+                outputChannels;
+
+            currentFrame[rearLeft] =
+                stereo.left;
+
+            currentFrame[rearRight] =
+                stereo.right;
+        }
+
+        hr = renderClient->ReleaseBuffer(
+            outputBufferFrames,
+            0
+        );
+
+        if (FAILED(hr))
+        {
+            hadError = true;
+            break;
+        }
+
+        //
+        // 이제 Render 시작
+        //
+        hr = outputClient->Start();
+
+        if (FAILED(hr))
+        {
+            hadError = true;
+            break;
+        }
+
+        outputStarted = true;
+
+        //
+        // ------------------------------------------------
+        // Event-driven main loop
+        // ------------------------------------------------
         //
         while (g_audioRunning)
         {
-            //
-            // --------------------------------
-            // Capture
-            // --------------------------------
-            //
-            UINT32 packetFrames = 0;
-
-            hr = captureClient->GetNextPacketSize(
-                &packetFrames
-            );
-
-            if (FAILED(hr))
-                break;
-
-            while (packetFrames > 0)
+            HANDLE waits[] =
             {
-                BYTE* data = nullptr;
-                UINT32 frames = 0;
-                DWORD flags = 0;
+                g_audioStopEvent,
+                captureEvent,
+                renderEvent
+            };
 
-                hr = captureClient->GetBuffer(
-                    &data,
-                    &frames,
-                    &flags,
-                    nullptr,
-                    nullptr
+            DWORD waitResult =
+                WaitForMultipleObjects(
+                    3,
+                    waits,
+                    FALSE,
+                    INFINITE
                 );
 
-                if (FAILED(hr))
-                    break;
-
-                bool silent =
-                    (flags &
-                        AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-
-                if (silent)
-                {
-                    for (UINT32 i = 0; i < frames; ++i)
-                    {
-                        audioQueue.push_back(0.0f);
-                        audioQueue.push_back(0.0f);
-                    }
-                }
-                else
-                {
-                    float* input =
-                        reinterpret_cast<float*>(data);
-
-                    for (UINT32 i = 0; i < frames; ++i)
-                    {
-                        float left =
-                            input[i * 2];
-
-                        float right =
-                            input[i * 2 + 1];
-
-                        audioQueue.push_back(left);
-                        audioQueue.push_back(right);
-                    }
-                }
-
-                captureClient->ReleaseBuffer(
-                    frames
-                );
-
-                hr = captureClient->GetNextPacketSize(
-                    &packetFrames
-                );
-
-                if (FAILED(hr))
-                    break;
+            //
+            // Stop
+            //
+            if (waitResult ==
+                WAIT_OBJECT_0)
+            {
+                break;
             }
 
-            if (FAILED(hr))
-                break;
-
             //
-            // --------------------------------
-            // Render
-            // --------------------------------
+            // Capture
             //
-            UINT32 padding = 0;
-
-            hr = outputClient->GetCurrentPadding(
-                &padding
-            );
-
-            if (FAILED(hr))
-                break;
-
-            UINT32 availableFrames =
-                outputBufferFrames - padding;
-
-            if (availableFrames > 0)
+            if (waitResult ==
+                WAIT_OBJECT_0 + 1)
             {
+                if (!DrainCapture())
+                {
+                    hadError = true;
+                    break;
+                }
+
+                continue;
+            }
+
+            //
+            // Render
+            //
+            if (waitResult ==
+                WAIT_OBJECT_0 + 2)
+            {
+                UINT32 padding = 0;
+
+                hr = outputClient->GetCurrentPadding(
+                    &padding
+                );
+
+                if (FAILED(hr))
+                {
+                    hadError = true;
+                    break;
+                }
+
+                UINT32 availableFrames =
+                    outputBufferFrames -
+                    padding;
+
+                if (availableFrames == 0)
+                    continue;
+
+                UINT32 framesToWrite =
+                    static_cast<UINT32>(
+                        (std::min)(
+                            static_cast<size_t>(
+                                availableFrames
+                                ),
+                            ringCount
+                            )
+                        );
+
+                if (framesToWrite == 0)
+                    continue;
+
                 BYTE* outputData = nullptr;
 
                 hr = renderClient->GetBuffer(
-                    availableFrames,
+                    framesToWrite,
                     &outputData
                 );
 
                 if (FAILED(hr))
+                {
+                    hadError = true;
                     break;
+                }
 
                 float* output =
                     reinterpret_cast<float*>(
@@ -1001,82 +1387,75 @@ void AudioThreadProc(
                         );
 
                 //
-                // 전체 출력 버퍼를 먼저 0으로
+                // Front와 나머지 채널은 모두 0.
+                // Shared mixer에서는 다른 앱의 Front가
+                // 그대로 함께 믹싱된다.
                 //
                 std::fill(
                     output,
                     output +
-                    (
-                        static_cast<size_t>(
-                            availableFrames
-                            ) *
-                        outputChannels
-                        ),
+                    static_cast<size_t>(
+                        framesToWrite
+                        ) *
+                    outputChannels,
                     0.0f
                 );
 
-                for (
-                    UINT32 frame = 0;
-                    frame < availableFrames;
+                for (UINT32 frame = 0;
+                    frame < framesToWrite;
                     ++frame)
                 {
-                    float left = 0.0f;
-                    float right = 0.0f;
+                    StereoFrame stereo = {};
 
-                    //
-                    // stereo 한 프레임이 준비됐다면 사용
-                    //
-                    if (audioQueue.size() >= 2)
-                    {
-                        left =
-                            audioQueue.front();
-
-                        audioQueue.pop_front();
-
-                        right =
-                            audioQueue.front();
-
-                        audioQueue.pop_front();
-                    }
+                    if (!PopFrame(stereo))
+                        break;
 
                     float* currentFrame =
                         output +
-                        (
-                            static_cast<size_t>(frame) *
-                            outputChannels
-                            );
+                        static_cast<size_t>(
+                            frame
+                            ) *
+                        outputChannels;
 
                     currentFrame[rearLeft] =
-                        left;
+                        stereo.left;
 
                     currentFrame[rearRight] =
-                        right;
+                        stereo.right;
                 }
 
                 hr = renderClient->ReleaseBuffer(
-                    availableFrames,
+                    framesToWrite,
                     0
                 );
 
                 if (FAILED(hr))
+                {
+                    hadError = true;
                     break;
+                }
+
+                continue;
             }
 
             //
-            // 첫 버전에서는 짧게 polling
+            // Wait 자체 실패
             //
-            Sleep(2);
+            hadError = true;
+            break;
         }
 
     } while (false);
 
     //
+    // ------------------------------------------------
     // Cleanup
+    // ------------------------------------------------
     //
-    if (inputStarted)
+    if (inputStarted && inputClient)
         inputClient->Stop();
 
-    if (outputStarted)
+    if (outputStarted && outputClient)
         outputClient->Stop();
 
     if (captureClient)
@@ -1103,6 +1482,17 @@ void AudioThreadProc(
     if (outputFormat)
         CoTaskMemFree(outputFormat);
 
+    if (captureEvent)
+        CloseHandle(captureEvent);
+
+    if (renderEvent)
+        CloseHandle(renderEvent);
+
+    if (mmcssHandle)
+        AvRevertMmThreadCharacteristics(
+            mmcssHandle
+        );
+
     CoUninitialize();
 
     g_audioRunning = false;
@@ -1110,7 +1500,7 @@ void AudioThreadProc(
     PostMessage(
         hWnd,
         WM_AUDIO_STOPPED,
-        FAILED(hr) ? 1 : 0,
+        hadError ? 1 : 0,
         0
     );
 }
@@ -1145,6 +1535,31 @@ void StartAudioRouting(HWND hWnd)
         return;
     }
 
+    if (g_audioStopEvent)
+    {
+        CloseHandle(g_audioStopEvent);
+        g_audioStopEvent = nullptr;
+    }
+
+    g_audioStopEvent = CreateEvent(
+        nullptr,
+        TRUE,       // manual reset
+        FALSE,
+        nullptr
+    );
+
+    if (!g_audioStopEvent)
+    {
+        MessageBox(
+            hWnd,
+            L"오디오 종료 이벤트를 생성하지 못했습니다.",
+            L"RearAudioRouter",
+            MB_OK | MB_ICONERROR
+        );
+
+        return;
+    }
+
     std::wstring inputId =
         g_inputDeviceIds[inputIndex];
 
@@ -1165,13 +1580,25 @@ void StartAudioRouting(HWND hWnd)
 
 void StopAudioRouting()
 {
-    if (!g_audioRunning)
+    if (!g_audioRunning &&
+        !g_audioThread.joinable())
+    {
         return;
+    }
 
     g_audioRunning = false;
 
+    if (g_audioStopEvent)
+        SetEvent(g_audioStopEvent);
+
     if (g_audioThread.joinable())
         g_audioThread.join();
+
+    if (g_audioStopEvent)
+    {
+        CloseHandle(g_audioStopEvent);
+        g_audioStopEvent = nullptr;
+    }
 }
 
 void CreateMainControls(HWND hWnd)
@@ -1778,6 +2205,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (g_audioThread.joinable())
             g_audioThread.join();
+
+        if (g_audioStopEvent)
+        {
+            CloseHandle(g_audioStopEvent);
+            g_audioStopEvent = nullptr;
+        }
 
         SetControlsRunning(false);
 
