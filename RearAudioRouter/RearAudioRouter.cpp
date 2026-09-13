@@ -49,6 +49,8 @@
 #define ID_TRAY_STARTSTOP  2002
 #define ID_TRAY_EXIT       2003
 
+#define IDC_CHECK_AUTOSTART 1005
+
 // 전역 변수:
 HINSTANCE hInst;                                // 현재 인스턴스입니다.
 WCHAR szTitle[MAX_LOADSTRING];                  // 제목 표시줄 텍스트입니다.
@@ -70,6 +72,9 @@ NOTIFYICONDATA g_nid = {};
 std::wstring g_configPath;
 
 HANDLE g_audioStopEvent = nullptr;
+
+HWND g_hCheckAutoStart = nullptr;
+bool g_startedFromAutoStart = false;
 
 // 이 코드 모듈에 포함된 함수의 선언을 전달합니다:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
@@ -1601,6 +1606,101 @@ void StopAudioRouting()
     }
 }
 
+bool IsAutoStartEnabled()
+{
+    HKEY hKey = nullptr;
+
+    if (RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0,
+        KEY_READ,
+        &hKey) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+
+    wchar_t value[MAX_PATH * 2] = {};
+    DWORD valueSize = sizeof(value);
+
+    LONG result = RegQueryValueExW(
+        hKey,
+        L"RearAudioRouter",
+        nullptr,
+        nullptr,
+        reinterpret_cast<LPBYTE>(value),
+        &valueSize
+    );
+
+    RegCloseKey(hKey);
+
+    return result == ERROR_SUCCESS;
+}
+
+bool SetAutoStartEnabled(bool enabled)
+{
+    HKEY hKey = nullptr;
+
+    LONG result = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0,
+        nullptr,
+        0,
+        KEY_WRITE,
+        nullptr,
+        &hKey,
+        nullptr
+    );
+
+    if (result != ERROR_SUCCESS)
+        return false;
+
+    if (enabled)
+    {
+        wchar_t exePath[MAX_PATH] = {};
+
+        GetModuleFileNameW(
+            nullptr,
+            exePath,
+            MAX_PATH
+        );
+
+        std::wstring command =
+            L"\"" +
+            std::wstring(exePath) +
+            L"\" --autostart";
+
+        result = RegSetValueExW(
+            hKey,
+            L"RearAudioRouter",
+            0,
+            REG_SZ,
+            reinterpret_cast<const BYTE*>(
+                command.c_str()
+                ),
+            static_cast<DWORD>(
+                (command.size() + 1) *
+                sizeof(wchar_t)
+                )
+        );
+    }
+    else
+    {
+        result = RegDeleteValueW(
+            hKey,
+            L"RearAudioRouter"
+        );
+
+        if (result == ERROR_FILE_NOT_FOUND)
+            result = ERROR_SUCCESS;
+    }
+
+    RegCloseKey(hKey);
+
+    return result == ERROR_SUCCESS;
+}
+
 void CreateMainControls(HWND hWnd)
 {
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -1676,6 +1776,24 @@ void CreateMainControls(HWND hWnd)
 
     SendMessage(g_hRadioRear, BM_SETCHECK, BST_CHECKED, 0);
 
+    g_hCheckAutoStart = CreateWindow(
+        L"BUTTON",
+        L"Start with Windows",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        20, 235, 180, 24,
+        hWnd,
+        (HMENU)IDC_CHECK_AUTOSTART,
+        nullptr,
+        nullptr
+    );
+
+    SendMessage(
+        g_hCheckAutoStart,
+        WM_SETFONT,
+        (WPARAM)hFont,
+        TRUE
+    );
+
     // Start button
     g_hButtonStart = CreateWindow(
         L"BUTTON",
@@ -1714,6 +1832,15 @@ void CreateMainControls(HWND hWnd)
         eRender,
         g_hComboOutput,
         g_outputDeviceIds
+    );
+
+    SendMessage(
+        g_hCheckAutoStart,
+        BM_SETCHECK,
+        IsAutoStartEnabled()
+        ? BST_CHECKED
+        : BST_UNCHECKED,
+        0
     );
 }
 
@@ -2016,6 +2143,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return 0;
     }
 
+    if (wcsstr(lpCmdLine, L"--autostart") != nullptr)
+    {
+        g_startedFromAutoStart = true;
+    }
+
     // 전역 문자열을 초기화합니다.
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_REARAUDIOROUTER, szWindowClass, MAX_LOADSTRING);
@@ -2095,7 +2227,15 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
       return FALSE;
    }
 
-   ShowWindow(hWnd, nCmdShow);
+   if (g_startedFromAutoStart)
+   {
+       ShowWindow(hWnd, SW_HIDE);
+   }
+   else
+   {
+       ShowWindow(hWnd, nCmdShow);
+   }
+
    UpdateWindow(hWnd);
 
    return TRUE;
@@ -2195,6 +2335,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 break;
             case ID_TRAY_EXIT:
                 DestroyWindow(hWnd);
+                break;
+            case IDC_CHECK_AUTOSTART:
+                if (HIWORD(wParam) == BN_CLICKED)
+                {
+                    bool enabled =
+                        SendMessage(
+                            g_hCheckAutoStart,
+                            BM_GETCHECK,
+                            0,
+                            0
+                        ) == BST_CHECKED;
+
+                    if (!SetAutoStartEnabled(enabled))
+                    {
+                        MessageBox(
+                            hWnd,
+                            L"Windows 시작 프로그램 설정을 변경하지 못했습니다.",
+                            L"RearAudioRouter",
+                            MB_OK | MB_ICONERROR
+                        );
+                    }
+                }
                 break;
             default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
